@@ -1,0 +1,14 @@
+services:
+  screenshot-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xiaocaoooo/screenshot-server:local
+    container_name: screenshot-server
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      # 必填：替换为你的 Playwright WebSocket 服务地址
+      PLAYWRIGHT_WS_ENDPOINT: "ws://host.docker.internal:3000"
+    restart: unless-stopped

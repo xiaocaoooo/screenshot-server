@@ -1,0 +1,13 @@
+# Go build artifacts
+/screenshot-server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out

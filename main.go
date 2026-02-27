@@ -44,6 +44,7 @@ type Clip struct {
 
 type ScreenshotRequest struct {
 	URL         string            `json:"url"`
+	Selector    string            `json:"selector"`
 	Width       int               `json:"width"`
 	Height      int               `json:"height"`
 	Format      string            `json:"format"`
@@ -170,9 +171,10 @@ func parseFloatQuery(c *gin.Context, key string, defaultValue float64) (float64,
 
 func parseRequestFromGET(c *gin.Context) (ScreenshotRequest, error) {
 	req := ScreenshotRequest{
-		URL:     c.Query("url"),
-		Format:  c.DefaultQuery("format", defaultFormat),
-		WaitFor: c.Query("wait_for"),
+		URL:      c.Query("url"),
+		Selector: c.Query("selector"),
+		Format:   c.DefaultQuery("format", defaultFormat),
+		WaitFor:  c.Query("wait_for"),
 	}
 
 	var err error
@@ -339,24 +341,38 @@ func screenshotHandler(playwrightWS string) gin.HandlerFunc {
 			page.WaitForTimeout(float64(req.WaitTime))
 		}
 
-		screenshotOptions := playwright.PageScreenshotOptions{
-			FullPage: playwright.Bool(req.FullPage),
-		}
 		screenshotType := playwright.ScreenshotType(req.Format)
-		screenshotOptions.Type = &screenshotType
-		if req.Format == "jpeg" || req.Format == "webp" {
-			screenshotOptions.Quality = playwright.Int(req.Quality)
-		}
-		if req.Clip != nil {
-			screenshotOptions.Clip = &playwright.Rect{
-				X:      req.Clip.X,
-				Y:      req.Clip.Y,
-				Width:  req.Clip.Width,
-				Height: req.Clip.Height,
-			}
-		}
 
-		img, err := page.Screenshot(screenshotOptions)
+		var img []byte
+		if req.Selector != "" {
+			selectorScreenshotOptions := playwright.LocatorScreenshotOptions{
+				Type: &screenshotType,
+			}
+			if req.Format == "jpeg" || req.Format == "webp" {
+				selectorScreenshotOptions.Quality = playwright.Int(req.Quality)
+			}
+			selectorScreenshotOptions.Timeout = playwright.Float(timeoutMS)
+
+			img, err = page.Locator(req.Selector).Screenshot(selectorScreenshotOptions)
+		} else {
+			screenshotOptions := playwright.PageScreenshotOptions{
+				FullPage: playwright.Bool(req.FullPage),
+				Type:     &screenshotType,
+			}
+			if req.Format == "jpeg" || req.Format == "webp" {
+				screenshotOptions.Quality = playwright.Int(req.Quality)
+			}
+			if req.Clip != nil {
+				screenshotOptions.Clip = &playwright.Rect{
+					X:      req.Clip.X,
+					Y:      req.Clip.Y,
+					Width:  req.Clip.Width,
+					Height: req.Clip.Height,
+				}
+			}
+
+			img, err = page.Screenshot(screenshotOptions)
+		}
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to screenshot", "details": err.Error()})
 			return

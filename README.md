@@ -142,6 +142,7 @@ docker run --rm -p 8080:8080 \
 | `quality` | int | 90 | 图片质量，范围 `1-100`（`jpeg/webp` 生效） |
 | `wait_time` | int | 0 | 额外等待时间（毫秒） |
 | `wait_for` | string | 空 | 等待元素出现（CSS 选择器） |
+| `selector` | string | 空 | 指定元素截图（CSS 选择器）；为空时截取页面 |
 | `full_page` | bool | false | 是否截取整页 |
 | `headers` | object | 空 | 自定义请求头 |
 | `user_agent` | string | 空 | 自定义 UA |
@@ -164,6 +165,9 @@ curl "http://localhost:8080/screenshot?url=https://www.google.com" --output scre
 # 指定尺寸和格式
 curl "http://localhost:8080/screenshot?url=https://www.google.com&width=1280&height=720&format=webp&quality=85" --output screenshot.webp
 
+# 指定元素截图（selector 为空则为页面截图）
+curl "http://localhost:8080/screenshot?url=https://example.com&selector=%23main" --output element.png
+
 # 自定义请求头（headers 需是 JSON 字符串）
 curl "http://localhost:8080/screenshot?url=https://example.com&headers=%7B%22Authorization%22%3A%22Bearer%20token123%22%7D" --output screenshot.png
 ```
@@ -175,6 +179,7 @@ curl -X POST http://localhost:8080/screenshot \
 	-H "Content-Type: application/json" \
 	-d '{
 		"url": "https://www.example.com",
+		"selector": "#main-content",
 		"width": 1440,
 		"height": 900,
 		"format": "webp",

@@ -1,6 +1,6 @@
 # screenshot-server
 
-基于 **Go + Gin + Playwright** 的网页截图服务，支持通过 HTTP API 截图，并连接外部 Playwright WebSocket 服务执行浏览器操作。
+基于 **Go + Gin + chromedp(+cdproto)** 的网页截图服务，支持通过 HTTP API 截图，并连接外部 **browserless/Chrome DevTools** 执行浏览器操作。
 
 ## 功能特性
 
@@ -30,9 +30,9 @@
 ## 运行要求
 
 - Go `1.23+`
-- 可访问的 Playwright Server（WebSocket 地址）
+- 可访问的 browserless（或其他提供 Chrome DevTools Protocol 的远程 Chrome）
 
-> 本服务通过环境变量 `PLAYWRIGHT_WS_ENDPOINT` 连接 Playwright。未配置时，`/health` 会返回降级状态，`/screenshot` 将不可用。
+> 本服务默认通过 `BROWSERLESS_HTTP_URL`（默认 `http://localhost:25004`）访问 `${BROWSERLESS_HTTP_URL}/json/version` 解析 `webSocketDebuggerUrl` 并连接。未配置/不可用时，`/health` 会返回降级状态，`/screenshot` 将不可用。
 
 ---
 
@@ -41,7 +41,8 @@
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `PORT` | 否 | `8080` | HTTP 服务端口 |
-| `PLAYWRIGHT_WS_ENDPOINT` | 是（截图时） | - | Playwright WebSocket 地址，例如 `ws://host.docker.internal:3000` |
+| `BROWSERLESS_HTTP_URL` | 否（建议配置） | `http://localhost:25004` | browserless 的 HTTP 地址；程序会请求 `/json/version` 获取 `webSocketDebuggerUrl` |
+| `CHROME_WS_ENDPOINT` | 否 | - | 直接指定 DevTools WS（优先级高于 `BROWSERLESS_HTTP_URL`） |
 
 ---
 
@@ -49,7 +50,7 @@
 
 ```bash
 go mod download
-PORT=8080 PLAYWRIGHT_WS_ENDPOINT=ws://127.0.0.1:3000 go run .
+PORT=8080 BROWSERLESS_HTTP_URL=http://127.0.0.1:25004 go run .
 ```
 
 服务启动后默认监听：`http://localhost:8080`
@@ -66,7 +67,7 @@ docker pull xiaocaoooo/screenshot-server:latest
 docker run -d --name screenshot-server \
 	-p 8080:8080 \
 	-e PORT=8080 \
-	-e PLAYWRIGHT_WS_ENDPOINT=ws://host.docker.internal:3000 \
+	-e BROWSERLESS_HTTP_URL=http://host.docker.internal:25004 \
 	--restart unless-stopped \
 	xiaocaoooo/screenshot-server:latest
 ```
@@ -83,7 +84,7 @@ docker compose up -d --build
 
 - 端口映射：`8080:8080`
 - 环境变量：`PORT=8080`
-- `PLAYWRIGHT_WS_ENDPOINT=ws://host.docker.internal:3000`（请按实际环境修改）
+- `BROWSERLESS_HTTP_URL=http://host.docker.internal:25004`（请按实际环境修改）
 
 ### 使用 Docker 单独运行
 
@@ -91,7 +92,7 @@ docker compose up -d --build
 docker build -t screenshot-server:local .
 docker run --rm -p 8080:8080 \
 	-e PORT=8080 \
-	-e PLAYWRIGHT_WS_ENDPOINT=ws://host.docker.internal:3000 \
+	-e BROWSERLESS_HTTP_URL=http://host.docker.internal:25004 \
 	screenshot-server:local
 ```
 
@@ -109,11 +110,11 @@ docker run --rm -p 8080:8080 \
 {
 	"status": "ok",
 	"time": "2026-02-27T00:00:00Z",
-	"playwright_ws_configured": true
+	"chrome_ws_available": true
 }
 ```
 
-当 `PLAYWRIGHT_WS_ENDPOINT` 未配置时：
+当 `BROWSERLESS_HTTP_URL` / `CHROME_WS_ENDPOINT` 未配置或不可用时：
 
 - HTTP 状态码为 `503`
 - `status` 为 `degraded`
@@ -225,8 +226,8 @@ curl -X POST http://localhost:8080/screenshot \
 常见错误状态码：
 
 - `400`：参数校验失败（如 URL 非法、width 超范围）
-- `503`：未配置 `PLAYWRIGHT_WS_ENDPOINT`
-- `502`：无法连接 Playwright 服务
+- `503`：未配置/不可用的 browserless/chrome endpoint
+- `502`：无法连接 browserless/chrome endpoint
 - `504`：页面加载超时 / `wait_for` 等待超时
 - `500`：截图执行失败或内部错误
 
@@ -234,5 +235,5 @@ curl -X POST http://localhost:8080/screenshot \
 
 ## 说明
 
-- 当前服务连接远程 Playwright，不在本进程内直接启动浏览器。
+- 当前服务连接远程 browserless/Chrome DevTools，不在本进程内直接启动浏览器。
 - 生产环境建议在入口网关限制目标 URL，避免被用于 SSRF 等风险场景。

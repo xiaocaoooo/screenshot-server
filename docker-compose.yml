@@ -9,6 +9,8 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
-      # 必填：替换为你的 Playwright WebSocket 服务地址
-      PLAYWRIGHT_WS_ENDPOINT: "ws://host.docker.internal:3000"
+      # 默认 browserless 端口为 25004；容器内访问宿主机建议用 host.docker.internal
+      BROWSERLESS_HTTP_URL: "http://host.docker.internal:25004"
+      # 可选：直接给 WS（优先级更高）
+      # CHROME_WS_ENDPOINT: "ws://host.docker.internal:25004/devtools/browser/<id>"
     restart: unless-stopped

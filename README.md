@@ -41,7 +41,7 @@
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `PORT` | 否 | `8080` | HTTP 服务端口 |
-| `BROWSERLESS_HTTP_URL` | 否（建议配置） | `http://localhost:25004` | browserless 的 HTTP 地址；程序会请求 `/json/version` 获取 `webSocketDebuggerUrl` |
+| `BROWSERLESS_HTTP_URL` | 否（建议配置） | `http://localhost:25004` | browserless 的 HTTP 地址；程序会请求 `/json/version` 获取 `webSocketDebuggerUrl`（若返回 `ws://0.0.0.0:xxxx` 会自动用该 HTTP 地址的 host:port 重写） |
 | `CHROME_WS_ENDPOINT` | 否 | - | 直接指定 DevTools WS（优先级高于 `BROWSERLESS_HTTP_URL`） |
 
 ---

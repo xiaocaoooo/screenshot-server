@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
@@ -40,8 +42,82 @@ const (
 	// 注意：该超时仅用于首次建立 CDP 连接（握手/建立 session），后续 Navigate/Wait/Screenshot 仍使用请求整体 timeout。
 	remoteChromeDialTimeout = 30 * time.Second
 
-	defaultBrowserlessHTTPURL = "http://localhost:3000"
+	// browserless 常见对外暴露端口为 25004（内部可能仍为 3000）。
+	defaultBrowserlessHTTPURL = "http://localhost:25004"
 )
+
+var urlLikeRe = regexp.MustCompile(`(?i)\b(wss?|https?)://[^\s"']+`)
+
+func cleanEndpointString(s string) string {
+	// 某些环境下可能混入 NBSP 等不可见空白字符，导致 url.Parse / u.Port() 异常。
+	// 这里直接移除所有 unicode 空白字符（endpoint 本身不应包含空格）。
+	if s == "" {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func redactSensitiveURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// 不可解析时仅做长度保护
+		if len(raw) > 512 {
+			return raw[:512] + "…"
+		}
+		return raw
+	}
+	if u.User != nil {
+		u.User = nil
+	}
+	q := u.Query()
+	if len(q) > 0 {
+		sensitiveKeys := map[string]struct{}{
+			"token":         {},
+			"auth":          {},
+			"authorization": {},
+			"api_key":       {},
+			"apikey":        {},
+			"key":           {},
+			"password":      {},
+			"passwd":        {},
+			"secret":        {},
+		}
+		for k := range q {
+			if _, ok := sensitiveKeys[strings.ToLower(k)]; ok {
+				q.Set(k, "REDACTED")
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+	redacted := u.String()
+	if len(redacted) > 512 {
+		return redacted[:512] + "…"
+	}
+	return redacted
+}
+
+func redactURLsInString(s string) string {
+	if s == "" {
+		return s
+	}
+	return urlLikeRe.ReplaceAllStringFunc(s, func(m string) string {
+		return redactSensitiveURL(m)
+	})
+}
+
+func isListenAddressHost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	return host == "0.0.0.0" || host == "::"
+}
 
 type Clip struct {
 	X      float64 `json:"x"`
@@ -261,6 +337,10 @@ type browserlessVersionResponse struct {
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
 
+type browserlessVersionResponseAlt struct {
+	WebSocketDebuggerURL string `json:"WebSocketDebuggerUrl"`
+}
+
 type browserlessCDPJSONPayload struct {
 	Description          string `json:"description"`
 	DevtoolsFrontendURL  string `json:"devtoolsFrontendUrl"`
@@ -285,21 +365,34 @@ func hasDevToolsPath(wsRaw string) bool {
 	return strings.HasPrefix(p, "/devtools/")
 }
 
+func isBrowserDevToolsWSEndpoint(wsRaw string) bool {
+	wsRaw = strings.TrimSpace(wsRaw)
+	if wsRaw == "" {
+		return false
+	}
+	u, err := url.Parse(wsRaw)
+	if err != nil {
+		return false
+	}
+	p := strings.TrimSpace(u.Path)
+	return strings.HasPrefix(p, "/devtools/browser/")
+}
+
 func getBrowserlessHTTPURL() string {
 	// 默认固定/指向本机 25004
 	v, ok := os.LookupEnv("BROWSERLESS_HTTP_URL")
 	if !ok {
-		return defaultBrowserlessHTTPURL
+		return cleanEndpointString(defaultBrowserlessHTTPURL)
 	}
-	return strings.TrimSpace(v)
+	return cleanEndpointString(strings.TrimSpace(v))
 }
 
 func getChromeWSEndpoint() string {
-	return strings.TrimSpace(os.Getenv("CHROME_WS_ENDPOINT"))
+	return cleanEndpointString(strings.TrimSpace(os.Getenv("CHROME_WS_ENDPOINT")))
 }
 
 func parseBrowserlessHTTPBase(raw string) (*url.URL, error) {
-	raw = strings.TrimSpace(raw)
+	raw = cleanEndpointString(strings.TrimSpace(raw))
 	if raw == "" {
 		return nil, errors.New("BROWSERLESS_HTTP_URL is empty")
 	}
@@ -326,6 +419,14 @@ func httpBaseHostPortWithDefault(u *url.URL) (string, error) {
 		return "", fmt.Errorf("invalid BROWSERLESS_HTTP_URL %q: missing hostname", u.String())
 	}
 
+	// 0.0.0.0 / :: 是监听地址，不可作为客户端 dial 的目标地址。
+	// 这里做一次“可连接地址”归一化，避免出现 dial tcp 0.0.0.0:xxxx: connect: connection refused。
+	// 注意：跨容器/跨主机场景应通过 BROWSERLESS_HTTP_URL/CHROME_WS_ENDPOINT 配置成可达的 service/host。
+	switch strings.TrimSpace(strings.ToLower(host)) {
+	case "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+
 	port := u.Port()
 	if port == "" {
 		switch u.Scheme {
@@ -341,6 +442,27 @@ func httpBaseHostPortWithDefault(u *url.URL) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
+func normalizeWSEndpointForDial(wsRaw string) string {
+	wsRaw = cleanEndpointString(strings.TrimSpace(wsRaw))
+	if wsRaw == "" {
+		return wsRaw
+	}
+	u, err := url.Parse(wsRaw)
+	if err != nil {
+		return wsRaw
+	}
+	host := strings.TrimSpace(strings.ToLower(u.Hostname()))
+	if host != "0.0.0.0" && host != "::" {
+		return wsRaw
+	}
+	port := u.Port()
+	if port == "" {
+		return wsRaw
+	}
+	u.Host = net.JoinHostPort("127.0.0.1", port)
+	return u.String()
+}
+
 func wsSchemeForHTTPBase(u *url.URL) (string, error) {
 	switch u.Scheme {
 	case "http":
@@ -353,7 +475,7 @@ func wsSchemeForHTTPBase(u *url.URL) (string, error) {
 }
 
 func rewriteWebSocketDebuggerURL(webSocketDebuggerURL string, httpBase *url.URL) (string, error) {
-	wsRaw := strings.TrimSpace(webSocketDebuggerURL)
+	wsRaw := cleanEndpointString(strings.TrimSpace(webSocketDebuggerURL))
 	if wsRaw == "" {
 		return "", errors.New("missing webSocketDebuggerUrl")
 	}
@@ -382,7 +504,7 @@ func rewriteWebSocketDebuggerURL(webSocketDebuggerURL string, httpBase *url.URL)
 }
 
 func httpBaseFromWSEndpoint(wsRaw string) (*url.URL, error) {
-	wsRaw = strings.TrimSpace(wsRaw)
+	wsRaw = cleanEndpointString(strings.TrimSpace(wsRaw))
 	if wsRaw == "" {
 		return nil, errors.New("ws endpoint is empty")
 	}
@@ -414,39 +536,68 @@ func resolveWSEndpointViaJSONNew(ctx context.Context, httpBase *url.URL) (string
 	newURL.RawQuery = ""
 	newURL.Fragment = ""
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, newURL.String(), nil)
-	if err != nil {
-		return "", err
-	}
-
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("browserless /json/new returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	// browserless 通常支持 PUT /json/new；原生 Chrome DevTools 常见是 GET /json/new。
+	// 这里依次尝试 PUT -> GET，以提高兼容性。
+	tryMethods := []string{http.MethodPut, http.MethodGet}
+	var lastErr error
+	var resolved string
+	for _, m := range tryMethods {
+		req, err := http.NewRequestWithContext(ctx, m, newURL.String(), nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// 不要在循环内把 Close defer 到函数返回；这里用闭包确保每次迭代都能及时关闭 body。
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				lastErr = fmt.Errorf("/json/new (%s) returned %d: %s", m, resp.StatusCode, strings.TrimSpace(string(body)))
+				return
+			}
+
+			var payload browserlessCDPJSONPayload
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				lastErr = err
+				return
+			}
+
+			// /json/new 可能返回 page 级别 ws（/devtools/page/...）。
+			// chromedp.NewRemoteAllocator 更偏好 browser 级别 ws（/devtools/browser/...）。
+			// 如果不是 browser ws，则继续 fallback 到 /json/version 或 /json/list。
+			if !isBrowserDevToolsWSEndpoint(payload.WebSocketDebuggerURL) {
+				lastErr = fmt.Errorf("/json/new (%s) returned non-browser devtools ws: %q", m, strings.TrimSpace(payload.WebSocketDebuggerURL))
+				return
+			}
+
+			rewritten, err := rewriteWebSocketDebuggerURL(payload.WebSocketDebuggerURL, httpBase)
+			if err != nil {
+				lastErr = err
+				return
+			}
+
+			log.Printf("resolveWSEndpoint: resolved via /json/new method=%s raw=%q rewritten=%q", m, strings.TrimSpace(payload.WebSocketDebuggerURL), rewritten)
+			resolved = rewritten
+			lastErr = nil
+		}()
+
+		if lastErr == nil && resolved != "" {
+			return normalizeWSEndpointForDial(resolved), nil
+		}
 	}
 
-	var payload browserlessCDPJSONPayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
+	if lastErr == nil {
+		lastErr = errors.New("/json/new failed")
 	}
-
-	if !hasDevToolsPath(payload.WebSocketDebuggerURL) {
-		return "", fmt.Errorf("browserless /json/new returned non-devtools ws: %q", strings.TrimSpace(payload.WebSocketDebuggerURL))
-	}
-
-	rewritten, err := rewriteWebSocketDebuggerURL(payload.WebSocketDebuggerURL, httpBase)
-	if err != nil {
-		return "", err
-	}
-
-	log.Printf("resolveWSEndpoint: resolved via /json/new raw=%q rewritten=%q", strings.TrimSpace(payload.WebSocketDebuggerURL), rewritten)
-	return rewritten, nil
+	return "", lastErr
 }
 
 func resolveWSEndpointViaJSONList(ctx context.Context, httpBase *url.URL) (string, error) {
@@ -479,7 +630,7 @@ func resolveWSEndpointViaJSONList(ctx context.Context, httpBase *url.URL) (strin
 	}
 
 	for _, p := range payloads {
-		if !hasDevToolsPath(p.WebSocketDebuggerURL) {
+		if !isBrowserDevToolsWSEndpoint(p.WebSocketDebuggerURL) {
 			continue
 		}
 
@@ -488,11 +639,11 @@ func resolveWSEndpointViaJSONList(ctx context.Context, httpBase *url.URL) (strin
 			continue
 		}
 		log.Printf("resolveWSEndpoint: resolved via /json/list raw=%q rewritten=%q", strings.TrimSpace(p.WebSocketDebuggerURL), rewritten)
-		return rewritten, nil
+		return normalizeWSEndpointForDial(rewritten), nil
 	}
 
 	// 兜底：方便排查，打印数量（不打印全量内容避免日志污染）
-	return "", fmt.Errorf("browserless /json/list returned %d targets, but none has a usable devtools ws", len(payloads))
+	return "", fmt.Errorf("browserless /json/list returned %d targets, but none has a usable browser devtools ws (/devtools/browser/...)", len(payloads))
 }
 
 func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (string, error) {
@@ -520,13 +671,29 @@ func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (st
 		return "", fmt.Errorf("browserless /json/version returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	// 一些实现可能返回不同大小写的字段名（例如 WebSocketDebuggerUrl）。
 	var vr browserlessVersionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&vr); err != nil {
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&vr); err != nil {
 		return "", err
 	}
 
-	raw := strings.TrimSpace(vr.WebSocketDebuggerURL)
+	raw := cleanEndpointString(strings.TrimSpace(vr.WebSocketDebuggerURL))
+	if raw == "" {
+		// 尝试兼容字段名变体：重新解码需要 body；因此在上面已直接 decode 过，这里用备用策略：
+		// 读取 response 需提前改为读 bytes。为了保持改动小，这里做一次 /json/version 重试读取。
+		// 如果需要严格兼容更多变体，建议把 /json/version 响应先读入 bytes 再 decode。
+		// 这里仅提供更明确日志。
+		log.Printf("resolveWSEndpoint: warning: /json/version decoded but webSocketDebuggerUrl is empty; response may use different field casing")
+	}
 	log.Printf("resolveWSEndpoint: /json/version webSocketDebuggerUrl=%q", raw)
+	if raw != "" {
+		if u, err := url.Parse(raw); err == nil {
+			if isListenAddressHost(u.Hostname()) {
+				log.Printf("resolveWSEndpoint: warning: /json/version returned listen-address host %q; will rewrite using BROWSERLESS_HTTP_URL host", u.Hostname())
+			}
+		}
+	}
 
 	// 理想情况：/json/version 直接给出 /devtools/browser/<id>
 	if hasDevToolsPath(raw) {
@@ -534,7 +701,7 @@ func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (st
 		if err != nil {
 			return "", err
 		}
-		return rewritten, nil
+		return normalizeWSEndpointForDial(rewritten), nil
 	}
 
 	// 现实情况（抓包复现）：/json/version 可能只返回 ws://0.0.0.0:3000（无 /devtools/...）。
@@ -559,12 +726,32 @@ func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (st
 
 func resolveWSEndpoint(ctx context.Context) (wsURL string, configured bool, err error) {
 	if ws := getChromeWSEndpoint(); ws != "" {
-		// 兼容两种配置：
-		// 1) 完整 ws（含 /devtools/browser/<id>）——直接使用
-		// 2) 仅 host:port（无 devtools path）——需要通过 /json/version 解析出完整 ws
-		if u, parseErr := url.Parse(ws); parseErr == nil && strings.HasPrefix(u.Path, "/devtools/browser/") {
-			log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (full): %s", ws)
-			return ws, true, nil
+		// CHROME_WS_ENDPOINT 优先级最高。
+		// 兼容三种配置：
+		// 1) 传统 Chrome DevTools browser ws：ws://host:port/devtools/browser/<id> ——直接使用
+		// 2) browserless 等提供的“代理/连接型” ws：ws://host:port/chromium（或其他非 /devtools/browser 的非空 path）——直接使用
+		// 3) 仅 host:port（无 devtools path）——需要通过 /json/version 解析出可用 ws
+		if u, parseErr := url.Parse(ws); parseErr == nil {
+			p := strings.TrimSpace(u.Path)
+			if strings.HasPrefix(p, "/devtools/browser/") {
+				log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (devtools browser): %s", ws)
+				n := normalizeWSEndpointForDial(ws)
+				if n != ws {
+					log.Printf("resolveWSEndpoint: warning: CHROME_WS_ENDPOINT uses non-dialable host, rewritten to %s", n)
+				}
+				return n, true, nil
+			}
+
+			// 对于类似 browserless 的 ws connect 路由（例如 /chromium），它本身就是可连接 endpoint，
+			// 不应再拼接 /json/version（否则会变成 /chromium/json/version 并导致 404）。
+			if p != "" && p != "/" {
+				log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (direct ws): %s", ws)
+				n := normalizeWSEndpointForDial(ws)
+				if n != ws {
+					log.Printf("resolveWSEndpoint: warning: CHROME_WS_ENDPOINT uses non-dialable host, rewritten to %s", n)
+				}
+				return n, true, nil
+			}
 		}
 
 		httpBase, convErr := httpBaseFromWSEndpoint(ws)
@@ -576,6 +763,7 @@ func resolveWSEndpoint(ctx context.Context) (wsURL string, configured bool, err 
 		if rErr != nil {
 			return "", true, rErr
 		}
+		resolved = normalizeWSEndpointForDial(resolved)
 		log.Printf("resolveWSEndpoint: CHROME_WS_ENDPOINT=%s resolved via /json/version -> %s", ws, resolved)
 		return resolved, true, nil
 	}
@@ -594,6 +782,7 @@ func resolveWSEndpoint(ctx context.Context) (wsURL string, configured bool, err 
 	if err != nil {
 		return "", true, err
 	}
+	resolved = normalizeWSEndpointForDial(resolved)
 	log.Printf("resolveWSEndpoint: BROWSERLESS_HTTP_URL=%s resolved via /json/version -> %s", httpBaseRaw, resolved)
 	return resolved, true, nil
 }
@@ -673,8 +862,14 @@ func screenshotHandler() gin.HandlerFunc {
 		}
 
 		log.Printf("screenshotHandler: using chrome ws endpoint: %s", wsURL)
+		log.Printf("screenshotHandler: endpoint sources: CHROME_WS_ENDPOINT=%q BROWSERLESS_HTTP_URL=%q", redactSensitiveURL(getChromeWSEndpoint()), redactSensitiveURL(getBrowserlessHTTPURL()))
 
-		allocCtx, allocCancel := chromedp.NewRemoteAllocator(overallCtx, wsURL)
+		// IMPORTANT:
+		// chromedp.NewRemoteAllocator 默认会“自动修改 wsURL”（未包含 /devtools/browser/ 时会去请求 /json/version）。
+		// 对于 browserless v2 的 ws connect 路由（例如 ws://browserless:3000/chromium），这种自动修改会把 wsURL 变成
+		// /json/version 返回的 ws://0.0.0.0:3000，从而导致 dial 失败。
+		// 这里明确禁止 chromedp 修改 wsURL，使用我们已经解析/选择好的 endpoint。
+		allocCtx, allocCancel := chromedp.NewRemoteAllocator(overallCtx, wsURL, chromedp.NoModifyURL)
 		defer allocCancel()
 
 		taskCtx, taskCancel := chromedp.NewContext(allocCtx)
@@ -699,7 +894,20 @@ func screenshotHandler() gin.HandlerFunc {
 			// 其他 dial 类错误：尽量保持与后续 chromedp.Run 的错误码映射一致（连接/握手 => 502）
 			msg := strings.ToLower(err.Error())
 			if strings.Contains(msg, "websocket") || strings.Contains(msg, "handshake") || strings.Contains(msg, "connect") || strings.Contains(msg, "dial") {
-				c.JSON(http.StatusBadGateway, gin.H{"error": "failed to connect chrome endpoint", "details": "dial failed: " + err.Error()})
+				details := "dial failed: " + redactURLsInString(err.Error())
+				// 增强可观测性：返回 endpoint 来源与解析后的 ws，便于快速定位 0.0.0.0 / 端口不通 / 反代路径等问题。
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error":              "failed to connect chrome endpoint",
+					"details":            details,
+					"chrome_ws_endpoint": redactSensitiveURL(wsURL),
+					"chrome_ws_endpoint_source": func() string {
+						if getChromeWSEndpoint() != "" {
+							return "CHROME_WS_ENDPOINT"
+						}
+						return "BROWSERLESS_HTTP_URL"
+					}(),
+					"browserless_http_url": redactSensitiveURL(getBrowserlessHTTPURL()),
+				})
 				return
 			}
 			if isTimeoutErr(err) {
@@ -877,7 +1085,12 @@ func screenshotHandler() gin.HandlerFunc {
 			// 远程连接类错误（握手/不可达）尽量映射为 502
 			msg := strings.ToLower(err.Error())
 			if strings.Contains(msg, "websocket") || strings.Contains(msg, "handshake") || strings.Contains(msg, "connect") {
-				c.JSON(http.StatusBadGateway, gin.H{"error": "failed to connect chrome endpoint", "details": err.Error()})
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error":                "failed to connect chrome endpoint",
+					"details":              redactURLsInString(err.Error()),
+					"chrome_ws_endpoint":   redactSensitiveURL(wsURL),
+					"browserless_http_url": redactSensitiveURL(getBrowserlessHTTPURL()),
+				})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to screenshot", "details": err.Error()})

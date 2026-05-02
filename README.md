@@ -8,6 +8,7 @@
 - 支持 `png / jpeg / webp` 输出格式
 - 支持全页截图、裁剪截图、自定义视口尺寸
 - 支持等待选择器、额外等待时间
+- 支持透明背景截图（`transparent` 参数）
 - 支持自定义 Header、User-Agent、移动端参数
 - 提供 `GET /health` 健康检查接口
 
@@ -151,6 +152,7 @@ docker run --rm -p 8080:8080 \
 | `mobile` | bool | false | 移动端模式 |
 | `landscape` | bool | false | 横屏模式（与 mobile 联动） |
 | `timeout` | int | 30 | 超时秒数，范围 `1-120` |
+| `transparent` | bool | false | 透明背景截图，仅 `png/webp` 格式有效（JPEG 不支持透明度） |
 | `clip` | object | 空 | 裁剪区域：`{x,y,width,height}` |
 
 ---
@@ -218,6 +220,27 @@ curl -X POST http://localhost:8080/screenshot \
 	}' \
 	--output cropped.jpg
 ```
+
+### 透明背景截图示例
+
+```bash
+# GET 方式
+curl "http://localhost:8080/screenshot?url=https://example.com&width=800&height=600&format=png&transparent=true" --output transparent.png
+
+# POST 方式
+curl -X POST http://localhost:8080/screenshot \
+	-H "Content-Type: application/json" \
+	-d '{
+		"url": "https://example.com",
+		"width": 800,
+		"height": 600,
+		"format": "png",
+		"transparent": true
+	}' \
+	--output transparent.png
+```
+
+**注意**：透明背景仅对 PNG 和 WebP 格式有效，JPEG 不支持透明度。
 
 ---
 

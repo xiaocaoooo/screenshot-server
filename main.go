@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
@@ -143,6 +145,7 @@ type ScreenshotRequest struct {
 	Landscape   bool              `json:"landscape"`
 	Timeout     int               `json:"timeout"`
 	Clip        *Clip             `json:"clip"`
+	Transparent bool              `json:"transparent"`
 }
 
 func (r *ScreenshotRequest) applyDefaults() {
@@ -218,6 +221,10 @@ func (r *ScreenshotRequest) validate() error {
 		if r.Clip.X < 0 || r.Clip.Y < 0 {
 			return errors.New("clip x/y must be >= 0")
 		}
+	}
+
+	if r.Transparent && r.Format == "jpeg" {
+		return errors.New("transparent is not supported with jpeg format, use png or webp")
 	}
 
 	return nil
@@ -302,6 +309,10 @@ func parseRequestFromGET(c *gin.Context) (ScreenshotRequest, error) {
 		return req, err
 	}
 	req.Landscape, err = parseBoolQuery(c, "landscape", false)
+	if err != nil {
+		return req, err
+	}
+	req.Transparent, err = parseBoolQuery(c, "transparent", false)
 	if err != nil {
 		return req, err
 	}
@@ -951,6 +962,19 @@ func screenshotHandler() gin.HandlerFunc {
 			actions = append(actions, chromedp.Sleep(time.Duration(req.WaitTime)*time.Millisecond))
 		}
 
+		if req.Transparent {
+			// 透明背景：
+			// 1. 注入 CSS 移除页面自身设置的 html/body 背景色
+			// 2. 截图时使用 omitBackground: true（见下方截图代码）
+			actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+				return chromedp.EvaluateAsDevTools(`(function() {
+					var s = document.createElement('style');
+					s.textContent = 'html, body { background: transparent !important; background-color: transparent !important; }';
+					document.head.appendChild(s);
+				})()`, nil).Do(ctx)
+			}))
+		}
+
 		// 元素截图 + 未设置 height：截图前先获取页面总高度，把视口高度扩展到页面高度。
 		// 不新增参数：以 height==0 作为触发条件。
 		if autoExpandViewportHeight {
@@ -1056,24 +1080,58 @@ func screenshotHandler() gin.HandlerFunc {
 
 		var img []byte
 		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-			cap := page.CaptureScreenshot().WithFromSurface(true).WithFormat(captureFormat(req.Format))
+			if req.Transparent {
+				// 透明背景：手动构建 params
+				params := map[string]interface{}{
+					"format":         string(captureFormat(req.Format)),
+					"fromSurface":    true,
+					"omitBackground": true,
+				}
 
-			// full_page 在给出大 clip 时，最好允许越过视口捕获
-			if req.FullPage && req.Selector == "" && req.Clip == nil {
-				cap = cap.WithCaptureBeyondViewport(true)
-			}
+				if req.FullPage && req.Selector == "" && req.Clip == nil {
+					params["captureBeyondViewport"] = true
+				}
 
-			if req.Format == "jpeg" || req.Format == "webp" {
-				cap = cap.WithQuality(int64(req.Quality))
+				if req.Format == "jpeg" || req.Format == "webp" {
+					params["quality"] = int64(req.Quality)
+				}
+
+				if clip != nil {
+					params["clip"] = clip
+				}
+
+				var res page.CaptureScreenshotReturns
+				err := cdp.Execute(ctx, page.CommandCaptureScreenshot, params, &res)
+				if err != nil {
+					return err
+				}
+				dec, err := base64.StdEncoding.DecodeString(res.Data)
+				if err != nil {
+					return err
+				}
+				img = dec
+			} else {
+				// 非透明背景：使用标准 API
+				cap := page.CaptureScreenshot().WithFromSurface(true).WithFormat(captureFormat(req.Format))
+
+				if req.FullPage && req.Selector == "" && req.Clip == nil {
+					cap = cap.WithCaptureBeyondViewport(true)
+				}
+
+				if req.Format == "jpeg" || req.Format == "webp" {
+					cap = cap.WithQuality(int64(req.Quality))
+				}
+
+				if clip != nil {
+					cap = cap.WithClip(clip)
+				}
+
+				buf, err := cap.Do(ctx)
+				if err != nil {
+					return err
+				}
+				img = buf
 			}
-			if clip != nil {
-				cap = cap.WithClip(clip)
-			}
-			buf, err := cap.Do(ctx)
-			if err != nil {
-				return err
-			}
-			img = buf
 			return nil
 		}))
 

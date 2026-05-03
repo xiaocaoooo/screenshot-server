@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -715,9 +714,19 @@ func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (st
 		return normalizeWSEndpointForDial(rewritten), nil
 	}
 
-	// 现实情况（抓包复现）：/json/version 可能只返回 ws://0.0.0.0:3000（无 /devtools/...）。
-	// 这种 ws 无法 websocket upgrade（会落到 HTTP 200），必须 fallback 到 /json/new 或 /json/list 获取完整 ws。
-	log.Printf("resolveWSEndpoint: /json/version ws missing /devtools path, fallback to /json/new then /json/list")
+	// browserless 代理模式：/json/version 返回 ws://host:port（无 /devtools 路径）
+	// 这是 browserless 的正常行为，直接使用该端点即可
+	if raw != "" {
+		log.Printf("resolveWSEndpoint: /json/version returned ws without /devtools path, using as browserless proxy mode: %s", raw)
+		rewritten, err := rewriteWebSocketDebuggerURL(raw, httpBase)
+		if err != nil {
+			return "", err
+		}
+		return normalizeWSEndpointForDial(rewritten), nil
+	}
+
+	// 如果 raw 为空，尝试 fallback
+	log.Printf("resolveWSEndpoint: /json/version returned empty ws, fallback to /json/new then /json/list")
 
 	if resolved, err := resolveWSEndpointViaJSONNew(ctx, httpBase); err == nil {
 		return resolved, nil
@@ -732,7 +741,7 @@ func resolveWSEndpointViaJSONVersion(ctx context.Context, httpBase *url.URL) (st
 	}
 
 	// 保留原始值，便于错误提示定位
-	return "", fmt.Errorf("browserless /json/version returned non-devtools ws (%q) and fallbacks (/json/new,/json/list) failed", raw)
+	return "", fmt.Errorf("browserless /json/version returned empty ws and fallbacks (/json/new,/json/list) failed")
 }
 
 func resolveWSEndpoint(ctx context.Context) (wsURL string, configured bool, err error) {
@@ -753,16 +762,27 @@ func resolveWSEndpoint(ctx context.Context) (wsURL string, configured bool, err 
 				return n, true, nil
 			}
 
-			// 对于类似 browserless 的 ws connect 路由（例如 /chromium），它本身就是可连接 endpoint，
-			// 不应再拼接 /json/version（否则会变成 /chromium/json/version 并导致 404）。
-			if p != "" && p != "/" {
-				log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (direct ws): %s", ws)
-				n := normalizeWSEndpointForDial(ws)
-				if n != ws {
-					log.Printf("resolveWSEndpoint: warning: CHROME_WS_ENDPOINT uses non-dialable host, rewritten to %s", n)
-				}
-				return n, true, nil
+		// 对于类似 browserless 的 ws connect 路由（例如 /chromium），它本身就是可连接 endpoint，
+		// 不应再拼接 /json/version（否则会变成 /chromium/json/version 并导致 404）。
+		// browserless 的代理模式使用根路径（无路径或 /），也应该直接使用
+		if p != "" && p != "/" {
+			log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (direct ws with path): %s", ws)
+			n := normalizeWSEndpointForDial(ws)
+			if n != ws {
+				log.Printf("resolveWSEndpoint: warning: CHROME_WS_ENDPOINT uses non-dialable host, rewritten to %s", n)
 			}
+			return n, true, nil
+		}
+		
+		// browserless 代理模式：直接使用根路径 WebSocket 端点
+		if p == "" || p == "/" {
+			log.Printf("resolveWSEndpoint: using CHROME_WS_ENDPOINT (browserless proxy mode, path=%q): %s", p, ws)
+			n := normalizeWSEndpointForDial(ws)
+			if n != ws {
+				log.Printf("resolveWSEndpoint: warning: CHROME_WS_ENDPOINT uses non-dialable host, rewritten to %s", n)
+			}
+			return n, true, nil
+		}
 		}
 
 		httpBase, convErr := httpBaseFromWSEndpoint(ws)
@@ -962,18 +982,21 @@ func screenshotHandler() gin.HandlerFunc {
 			actions = append(actions, chromedp.Sleep(time.Duration(req.WaitTime)*time.Millisecond))
 		}
 
-		if req.Transparent {
-			// 透明背景：
-			// 1. 注入 CSS 移除页面自身设置的 html/body 背景色
-			// 2. 截图时使用 omitBackground: true（见下方截图代码）
-			actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-				return chromedp.EvaluateAsDevTools(`(function() {
-					var s = document.createElement('style');
-					s.textContent = 'html, body { background: transparent !important; background-color: transparent !important; }';
-					document.head.appendChild(s);
-				})()`, nil).Do(ctx)
-			}))
-		}
+	if req.Transparent {
+		// 透明背景：
+		// 1. 设置透明背景色（必须在截图前设置）
+		actions = append(actions, emulation.SetDefaultBackgroundColorOverride().
+			WithColor(&cdp.RGBA{R: 0, G: 0, B: 0, A: 0}))
+		
+		// 2. 注入 CSS 移除页面自身设置的 html/body 背景色
+		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+			return chromedp.EvaluateAsDevTools(`(function() {
+				var s = document.createElement('style');
+				s.textContent = 'html, body { background: transparent !important; background-color: transparent !important; }';
+				document.head.appendChild(s);
+			})()`, nil).Do(ctx)
+		}))
+	}
 
 		// 元素截图 + 未设置 height：截图前先获取页面总高度，把视口高度扩展到页面高度。
 		// 不新增参数：以 height==0 作为触发条件。
@@ -1078,62 +1101,30 @@ func screenshotHandler() gin.HandlerFunc {
 			}))
 		}
 
-		var img []byte
-		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-			if req.Transparent {
-				// 透明背景：手动构建 params
-				params := map[string]interface{}{
-					"format":         string(captureFormat(req.Format)),
-					"fromSurface":    true,
-					"omitBackground": true,
-				}
+	var img []byte
+	actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+		// 使用标准 API（透明背景已通过 SetDefaultBackgroundColorOverride 设置）
+		cap := page.CaptureScreenshot().WithFromSurface(true).WithFormat(captureFormat(req.Format))
 
-				if req.FullPage && req.Selector == "" && req.Clip == nil {
-					params["captureBeyondViewport"] = true
-				}
+		if req.FullPage && req.Selector == "" && req.Clip == nil {
+			cap = cap.WithCaptureBeyondViewport(true)
+		}
 
-				if req.Format == "jpeg" || req.Format == "webp" {
-					params["quality"] = int64(req.Quality)
-				}
+		if req.Format == "jpeg" || req.Format == "webp" {
+			cap = cap.WithQuality(int64(req.Quality))
+		}
 
-				if clip != nil {
-					params["clip"] = clip
-				}
+		if clip != nil {
+			cap = cap.WithClip(clip)
+		}
 
-				var res page.CaptureScreenshotReturns
-				err := cdp.Execute(ctx, page.CommandCaptureScreenshot, params, &res)
-				if err != nil {
-					return err
-				}
-				dec, err := base64.StdEncoding.DecodeString(res.Data)
-				if err != nil {
-					return err
-				}
-				img = dec
-			} else {
-				// 非透明背景：使用标准 API
-				cap := page.CaptureScreenshot().WithFromSurface(true).WithFormat(captureFormat(req.Format))
-
-				if req.FullPage && req.Selector == "" && req.Clip == nil {
-					cap = cap.WithCaptureBeyondViewport(true)
-				}
-
-				if req.Format == "jpeg" || req.Format == "webp" {
-					cap = cap.WithQuality(int64(req.Quality))
-				}
-
-				if clip != nil {
-					cap = cap.WithClip(clip)
-				}
-
-				buf, err := cap.Do(ctx)
-				if err != nil {
-					return err
-				}
-				img = buf
-			}
-			return nil
-		}))
+		buf, err := cap.Do(ctx)
+		if err != nil {
+			return err
+		}
+		img = buf
+		return nil
+	}))
 
 		if err := chromedp.Run(taskCtx, actions...); err != nil {
 			if isTimeoutErr(err) {
